@@ -36,7 +36,7 @@ final class Overlay: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
         panel.hidesOnDeactivate = false
         panel.becomesKeyOnlyIfNeeded = true
         panel.isMovableByWindowBackground = true
-        panel.movable = true
+        panel.isMovable = true
 
         let config = WKWebViewConfiguration()
         config.userContentController.add(self, name: "kitty")
