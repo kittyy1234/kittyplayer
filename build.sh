@@ -9,23 +9,22 @@ DMG="$BUILD/$APP_NAME.dmg"
 SOURCES="$ROOT/Sources/KittyPlayer"
 RESOURCES="$ROOT/Resources"
 
-echo "Building $APP_NAME (universal)…"
+ARCH="$(uname -m)"
+if [[ "$ARCH" != "arm64" && "$ARCH" != "x86_64" ]]; then
+  ARCH="arm64"
+fi
+
+echo "Building $APP_NAME ($ARCH)…"
 rm -rf "$BUILD"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 SRC=( "$SOURCES"/*.swift )
 
-for ARCH in arm64 x86_64; do
-  echo "  compiling $ARCH"
-  OUT="$BUILD/KittyPlayer-$ARCH"
-  swiftc -O -target "${ARCH}-apple-macos12" \
-    -framework AppKit -framework WebKit -framework Foundation -framework CryptoKit \
-    "${SRC[@]}" \
-    -o "$OUT"
-done
-
-lipo -create "$BUILD/KittyPlayer-arm64" "$BUILD/KittyPlayer-x86_64" \
-  -output "$APP/Contents/MacOS/KittyPlayer"
+echo "  compiling $ARCH"
+swiftc -O -target "${ARCH}-apple-macos12" \
+  -framework AppKit -framework WebKit -framework Foundation -framework CryptoKit \
+  "${SRC[@]}" \
+  -o "$APP/Contents/MacOS/KittyPlayer"
 chmod +x "$APP/Contents/MacOS/KittyPlayer"
 
 cp "$RESOURCES/overlay.html" "$APP/Contents/Resources/overlay.html"
@@ -47,7 +46,6 @@ if [[ -n "$ICON_SRC" ]]; then
   if [[ "$ICON_SRC" == *.icns ]]; then
     cp "$ICON_SRC" "$APP/Contents/Resources/AppIcon.icns"
     ICON_KEY=$'\n  <key>CFBundleIconFile</key>\n  <string>AppIcon</string>'
-    echo "  icon: $ICON_SRC"
   else
     ICONSET="$BUILD/AppIcon.iconset"
     mkdir -p "$ICONSET"
@@ -63,10 +61,9 @@ if [[ -n "$ICON_SRC" ]]; then
     sips -z 1024 1024 "$ICON_SRC" --out "$ICONSET/walt.e@example.net" >/dev/null
     iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
     ICON_KEY=$'\n  <key>CFBundleIconFile</key>\n  <string>AppIcon</string>'
-    echo "  icon: $ICON_SRC → AppIcon.icns"
   fi
 else
-  echo "  (no Icon.png found – default app icon)"
+  echo "  (no Icon.png – default icon)"
 fi
 
 cat > "$APP/Contents/Info.plist" << PLIST
@@ -95,7 +92,7 @@ cat > "$APP/Contents/Info.plist" << PLIST
   <key>NSHighResolutionCapable</key>
   <true/>
   <key>NSAppleEventsUsageDescription</key>
-  <string>KittyPlayer needs to control Spotify and Apple Music to show now playing and send play/pause/next/previous.</string>
+  <string>KittyPlayer needs to control Spotify and Apple Music.</string>
   <key>NSAppTransportSecurity</key>
   <dict>
     <key>NSAllowsArbitraryLoads</key>
@@ -110,7 +107,6 @@ codesign --force --deep --sign - "$APP" 2>/dev/null || true
 xattr -cr "$APP" 2>/dev/null || true
 
 echo "App: $APP"
-
 echo "Creating DMG…"
 STAGE="$BUILD/dmg-stage"
 rm -rf "$STAGE"
