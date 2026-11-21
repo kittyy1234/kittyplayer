@@ -1,0 +1,214 @@
+import AppKit
+import WebKit
+
+final class Overlay: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
+    private var panel: NSPanel!
+    private var webView: WKWebView!
+    private let media: Media
+    private var isReady = false
+    private var pendingJS: [String] = []
+
+    init(media: Media) {
+        self.media = media
+        super.init()
+        buildPanel()
+    }
+
+    private func buildPanel() {
+        let screen = NSScreen.main?.visibleFrame ?? .zero
+        let width: CGFloat = 480
+        let height: CGFloat = 130
+        let x = screen.midX - width / 2
+        let y = screen.minY + 24
+
+        panel = NSPanel(
+            contentRect: NSRect(x: x, y: y, width: width, height: height),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.isFloatingPanel = true
+        panel.level = .floating
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.hidesOnDeactivate = false
+        panel.becomesKeyOnlyIfNeeded = true
+        panel.isMovableByWindowBackground = true
+        panel.movable = true
+
+        let config = WKWebViewConfiguration()
+        config.userContentController.add(self, name: "kitty")
+        let prefs = WKWebpagePreferences()
+        prefs.allowsContentJavaScript = true
+        config.defaultWebpagePreferences = prefs
+
+        webView = WKWebView(frame: panel.contentView!.bounds, configuration: config)
+        webView.navigationDelegate = self
+        webView.setValue(false, forKey: "drawsBackground")
+        webView.allowsBackForwardNavigationGestures = false
+        if #available(macOS 13.3, *) {
+            webView.isInspectable = true
+        }
+        webView.autoresizingMask = [.width, .height]
+        panel.contentView?.addSubview(webView)
+
+        let candidates: [URL?] = [
+            Bundle.main.url(forResource: "overlay", withExtension: "html"),
+            Bundle.main.resourceURL?.appendingPathComponent("overlay.html"),
+            Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/overlay.html")
+        ]
+        if let url = candidates.compactMap({ $0 }).first(where: { FileManager.default.fileExists(atPath: $0.path) }) {
+            webView.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())
+        } else {
+            let html = """
+            <html><body style="background:transparent;color:#fff;font-family:-apple-system;padding:20px">
+            KittyPlayer: overlay.html missing from bundle.
+            </body></html>
+            """
+            webView.loadHTMLString(html, baseURL: nil)
+        }
+    }
+
+    func show() {
+        panel.orderFrontRegardless()
+    }
+
+    func hide() {
+        panel.orderOut(nil)
+    }
+
+    func close() {
+        panel.close()
+    }
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard message.name == "kitty",
+              let body = message.body as? [String: Any],
+              let action = body["action"] as? String else { return }
+        let value = body["value"]
+
+        switch action {
+        case "resize-window":
+            if let dict = value as? [String: Any] {
+                let w = (dict["width"] as? NSNumber)?.doubleValue ?? (dict["width"] as? Double) ?? 480
+                let h = (dict["height"] as? NSNumber)?.doubleValue ?? (dict["height"] as? Double) ?? 130
+                resize(to: CGSize(width: w, height: h))
+            }
+        case "playpause":
+            media.control("playpause")
+        case "next":
+            media.control("next")
+        case "prev":
+            media.control("prev")
+        case "scrub":
+            if let sec = value as? Double ?? (value as? NSNumber)?.doubleValue {
+                media.scrub(sec)
+            }
+        case "volume":
+            if let v = value as? Double ?? (value as? NSNumber)?.doubleValue {
+                media.setVolume(v)
+            }
+        case "playUri", "playPlaylist":
+            if let uri = value as? String {
+                media.play(uri: uri)
+            }
+        case "getRealPlaylists":
+            media.spotify.fetchPlaylists { [weak self] list in
+                self?.sendPlaylists(list)
+            }
+        case "getPlaylistTracks":
+            if let id = value as? String {
+                media.spotify.fetchPlaylistTracks(id) { [weak self] tracks in
+                    self?.sendTracks(tracks)
+                }
+            }
+        case "search":
+            if let q = value as? String {
+                media.spotify.search(q) { [weak self] tracks in
+                    self?.sendSearch(tracks)
+                }
+            }
+        case "login":
+            media.spotify.login { [weak self] ok in
+                self?.sendAuthStatus(connected: ok)
+                if ok {
+                    self?.media.spotify.fetchPlaylists { list in
+                        self?.sendPlaylists(list)
+                    }
+                }
+            }
+        case "setSource":
+            if let s = value as? String {
+                if s == "appleMusic" {
+                    media.activeSource = .appleMusic
+                } else {
+                    media.activeSource = .spotify
+                }
+            }
+        default:
+            break
+        }
+    }
+
+    private func resize(to size: CGSize) {
+        guard let screen = NSScreen.main?.visibleFrame else { return }
+        let w = max(320, size.width)
+        let h = max(110, size.height)
+        var frame = panel.frame
+        frame.size = CGSize(width: w, height: h)
+        if frame.origin.x < screen.minX || frame.maxX > screen.maxX {
+            frame.origin.x = screen.midX - w / 2
+        }
+        if frame.origin.y < screen.minY {
+            frame.origin.y = screen.minY + 24
+        }
+        panel.setFrame(frame, display: true, animate: false)
+    }
+
+    private func eval(_ js: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if self.isReady {
+                self.webView.evaluateJavaScript(js, completionHandler: nil)
+            } else {
+                self.pendingJS.append(js)
+            }
+        }
+    }
+
+    func sendNowPlaying(_ state: [String: Any]) {
+        guard let data = try? JSONSerialization.data(withJSONObject: state),
+              let json = String(data: data, encoding: .utf8) else { return }
+        eval("window.__kittyRecv && window.__kittyRecv('spotify-data', \(json));")
+    }
+
+    func sendPlaylists(_ list: [[String: Any]]) {
+        guard let data = try? JSONSerialization.data(withJSONObject: list),
+              let json = String(data: data, encoding: .utf8) else { return }
+        eval("window.__kittyRecv && window.__kittyRecv('playlists-reply', \(json));")
+    }
+
+    func sendTracks(_ list: [[String: Any]]) {
+        guard let data = try? JSONSerialization.data(withJSONObject: list),
+              let json = String(data: data, encoding: .utf8) else { return }
+        eval("window.__kittyRecv && window.__kittyRecv('tracks-reply', \(json));")
+    }
+
+    func sendSearch(_ list: [[String: Any]]) {
+        guard let data = try? JSONSerialization.data(withJSONObject: list),
+              let json = String(data: data, encoding: .utf8) else { return }
+        eval("window.__kittyRecv && window.__kittyRecv('search-reply', \(json));")
+    }
+
+    func sendAuthStatus(connected: Bool) {
+        eval("window.__kittyRecv && window.__kittyRecv('auth-status', {\"connected\": \(connected ? "true" : "false")});")
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        isReady = true
+        pendingJS.forEach { webView.evaluateJavaScript($0, completionHandler: nil) }
+        pendingJS.removeAll()
+    }
+}
